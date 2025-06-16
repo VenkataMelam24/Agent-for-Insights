@@ -50,9 +50,7 @@ def apply_theme(theme):
 apply_theme(selected_theme)
 
 # --- PAGE TITLE ---
-st.markdown(
-    f"<h1 style='text-align: center;'>🤖 Smart Data Agent</h1>", unsafe_allow_html=True
-)
+st.markdown("<h1 style='text-align: center;'>🤖 Smart Data Agent</h1>", unsafe_allow_html=True)
 
 # --- FILE LOADING ---
 df = None
@@ -72,13 +70,43 @@ if file:
     elif file.name.endswith(".xlsx"):
         xls = pd.ExcelFile(file)
         sheets = xls.sheet_names
-        all_data = []
+        st.chat_message("assistant").write(f"📄 Uploaded Excel with **{len(sheets)}** sheet(s): {', '.join(sheets)}")
+
+        common_cols = None
+        sheet_data = {}
+
+        # Load each sheet individually
         for sheet in sheets:
             temp_df = xls.parse(sheet)
-            temp_df['__sheet__'] = sheet
-            all_data.append(temp_df)
-        df = pd.concat(all_data, ignore_index=True)
-        st.chat_message("assistant").write(f"📄 Excel with **{len(sheets)}** sheet(s) loaded & merged!")
+            sheet_data[sheet] = temp_df
+            if common_cols is None:
+                common_cols = set(temp_df.columns)
+            else:
+                common_cols &= set(temp_df.columns)
+
+        # User selects which sheet to preview
+        selected_sheet = st.selectbox("🗂 Select a sheet to preview", options=sheets)
+        df = sheet_data[selected_sheet]
+        st.chat_message("assistant").write(f"📊 Preview of **{selected_sheet}**:")
+        st.dataframe(df.head())
+
+        # Try merging only if common columns exist
+        if len(sheet_data) > 1:
+            if common_cols:
+                st.chat_message("assistant").write(
+                    f"🔗 Merging sheets on common columns: {', '.join(common_cols)}"
+                )
+                try:
+                    merged_df = pd.concat(
+                        [df[list(common_cols)] for df in sheet_data.values()],
+                        ignore_index=True
+                    )
+                    df = merged_df  # This will be used for GPT later
+                    st.chat_message("assistant").write("✅ Sheets merged successfully!")
+                except Exception as e:
+                    st.chat_message("assistant").write(f"⚠️ Merge failed: {e}")
+            else:
+                st.chat_message("assistant").write("❌ No common columns found. Skipping merge.")
 
 elif sheet_url:
     if is_valid_url(sheet_url):
@@ -94,8 +122,8 @@ elif sheet_url:
 
 # --- PREVIEW + SUGGESTIONS ---
 if df is not None:
-    st.chat_message("assistant").write("📊 Here's a preview of your uploaded data:")
-    st.dataframe(df.head())
+    # st.chat_message("assistant").write("📊 Here's a preview of your uploaded data:")
+    # st.dataframe(df.head())
 
     st.chat_message("assistant").write("💡 Suggested questions you can ask:")
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
