@@ -6,18 +6,19 @@ import os
 from dotenv import load_dotenv
 from openai import OpenAI
 import requests
+import plotly.graph_objects as go
 
 # Load OpenAI API key from .env
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-st.set_page_config(page_title="Smart Data Agent", layout="wide")
+st.set_page_config(page_title="Smart Adhoc Agent", layout="wide")
 
 # Session state
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-st.title("🤖 Smart Data Agent")
+st.title("🤖 Smart Adhoc Agent")
 
 # File input
 with st.sidebar:
@@ -58,10 +59,30 @@ if tables:
         except Exception as e:
             st.warning(f"❌ Failed to register {name}: {e}")
 
+    # Attempt automatic merge if common columns exist
+    common_cols = set.intersection(*(set(df.columns) for df in tables.values())) if len(tables) > 1 else set()
+    if common_cols:
+        try:
+            table_list = list(tables.keys())
+            join_expr = f" USING ({', '.join(common_cols)}) "
+            merged_sql = f"SELECT * FROM {table_list[0]} " + " ".join([f"JOIN {tbl} {join_expr}" for tbl in table_list[1:]])
+            merged_df = con.sql(merged_sql).df()
+            con.register("merged_data", merged_df)
+            tables["merged_data"] = merged_df
+            st.success(f"🧬 Auto-merged table 'merged_data' created on common columns: {', '.join(common_cols)}")
+        except Exception as e:
+            st.warning(f"⚠️ Failed to auto-merge tables: {e}")
+
+    # Show preview and profiling for first table
     first_key = next(iter(tables))
     df_preview = tables[first_key]
     st.subheader("📊 Preview of first table")
     st.dataframe(df_preview.head())
+
+    for name, df in tables.items():
+        st.subheader(f"📊 Profiling: {name}")
+        profile = df.describe(include='all').transpose()
+        st.dataframe(profile)
 
 # User chat
 if tables:
@@ -75,20 +96,34 @@ if tables:
                 f"{name} → {', '.join(df.columns)}" for name, df in tables.items()
             ])
 
-            prompt = f"""You are a SQL analyst using DuckDB.
-Available tables and their columns:
+            prompt = f"""You are an expert SQL assistant using DuckDB.
+Only use the following tables and columns:
 {schema_description}
 
-Write a valid SQL query using DuckDB syntax to answer:
+Rules:
+- Do not guess column names.
+- Use only listed tables/columns.
+- If user asks about time trends, prefer grouping by month if date fields are present.
+- Output only SQL code without explanation.
+
+Question:
 {user_input}
-Only return the SQL query, nothing else."""
+"""
+
+            history = [
+                {"role": r, "content": m if isinstance(m, str) else "<table result>"}
+                for r, m in st.session_state.chat_history[-4:]
+            ]
+
+            messages = [
+                {"role": "system", "content": "You are a SQL expert helping users query data using DuckDB. Only use valid table/column names provided."}
+            ] + history + [
+                {"role": "user", "content": prompt}
+            ]
 
             response = client.chat.completions.create(
                 model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "You are a SQL expert helping a user with their data."},
-                    {"role": "user", "content": prompt}
-                ]
+                messages=messages
             )
 
             sql_code = response.choices[0].message.content.strip("```sql").strip("```")
@@ -96,8 +131,21 @@ Only return the SQL query, nothing else."""
             st.chat_message("assistant").markdown(f"💡 SQL Query:\n```sql\n{sql_code}\n```")
 
             result_df = con.sql(sql_code).df()
-            st.chat_message("assistant").write(result_df)
-            st.session_state.chat_history.append(("assistant", result_df))
+
+            clean_df = result_df.copy()
+            if clean_df.index.name or clean_df.index.to_list() == list(range(len(clean_df))):
+                clean_df.reset_index(drop=True, inplace=True)
+
+            for col in clean_df.select_dtypes(include=["datetime64[ns]"]).columns:
+                clean_df[col] = clean_df[col].dt.strftime('%Y-%m')
+
+            table = go.Figure(data=[go.Table(
+                header=dict(values=list(clean_df.columns), fill_color='lightgray', align='left'),
+                cells=dict(values=[clean_df[col] for col in clean_df.columns], align='left')
+            )])
+            st.chat_message("assistant").plotly_chart(table, use_container_width=True, key=f"plot_{len(st.session_state.chat_history)}")
+
+            st.session_state.chat_history.append(("assistant", clean_df))
 
         except Exception as e:
             st.chat_message("assistant").write(f"⚠️ GPT or SQL Error: {e}")
@@ -108,7 +156,11 @@ Only return the SQL query, nothing else."""
             st.chat_message("user").write(msg)
         else:
             if isinstance(msg, pd.DataFrame):
-                st.chat_message("assistant").write(msg)
+                table = go.Figure(data=[go.Table(
+                    header=dict(values=list(msg.columns), fill_color='lightgray', align='left'),
+                    cells=dict(values=[msg[col] for col in msg.columns], align='left')
+                )])
+                st.chat_message("assistant").plotly_chart(table, use_container_width=True, key=f"history_plot_{hash(str(msg))}")
             else:
                 st.chat_message("assistant").write(str(msg))
 else:
