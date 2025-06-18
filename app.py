@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import requests
 import plotly.graph_objects as go
+from datetime import datetime
+import re
 
 # Load OpenAI API key from .env
 load_dotenv()
@@ -50,6 +52,22 @@ elif sheet_url and "docs.google.com" in sheet_url:
     except Exception as e:
         st.error(f"❌ Failed to read Google Sheet: {e}")
 
+# Convert possible date-like string columns to datetime for DuckDB compatibility
+def is_date_column(series):
+    # Heuristic: check if >50% values parse as datetime
+    parsed = pd.to_datetime(series, errors='coerce')
+    non_null_ratio = parsed.notnull().sum() / len(parsed)
+    return non_null_ratio > 0.5
+
+for name, df in tables.items():
+    for col in df.columns:
+        if df[col].dtype == object:
+            if is_date_column(df[col]):
+                try:
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+                except Exception:
+                    pass
+
 # Register with DuckDB and show preview
 if tables:
     con = duckdb.connect()
@@ -59,7 +77,7 @@ if tables:
         except Exception as e:
             st.warning(f"❌ Failed to register {name}: {e}")
 
-    # Attempt automatic merge if common columns exist
+    # Attempt automatic merge on common columns
     common_cols = set.intersection(*(set(df.columns) for df in tables.values())) if len(tables) > 1 else set()
     if common_cols:
         try:
@@ -84,10 +102,14 @@ if tables:
         profile = df.describe(include='all').transpose()
         st.dataframe(profile)
 
-# User chat
+# User chat input and response handling
 if tables:
     user_input = st.chat_input("Ask a question about your data")
     if user_input:
+        # Log user query with timestamp
+        with open("user_logs.csv", "a") as f:
+            f.write(f"{user_input},{datetime.now()}\n")
+
         st.session_state.chat_history.append(("user", user_input))
         st.chat_message("user").write(user_input)
 
@@ -96,17 +118,19 @@ if tables:
                 f"{name} → {', '.join(df.columns)}" for name, df in tables.items()
             ])
 
-            prompt = f"""You are an expert SQL assistant using DuckDB.
-Only use the following tables and columns:
+            prompt = f"""
+You are an expert SQL assistant using DuckDB.
+Only use the following tables and columns exactly as listed:
 {schema_description}
 
-Rules:
-- Do not guess column names.
-- Use only listed tables/columns.
-- If user asks about time trends, prefer grouping by month if date fields are present.
-- Output only SQL code without explanation.
+Important:
+- Date and datetime columns are properly typed as DATE or TIMESTAMP.
+- Use DuckDB-compatible functions for dates, such as EXTRACT(YEAR FROM date_column) or YEAR(date_column).
+- When filtering or grouping by year or month, use appropriate date functions.
+- Do NOT guess column names.
+- Output ONLY the valid SQL query with no explanations or extra text.
 
-Question:
+User Question:
 {user_input}
 """
 
@@ -126,7 +150,9 @@ Question:
                 messages=messages
             )
 
-            sql_code = response.choices[0].message.content.strip("```sql").strip("```")
+            content = response.choices[0].message.content
+            match = re.search(r"```sql\s*(.*?)```", content, re.DOTALL | re.IGNORECASE)
+            sql_code = match.group(1).strip() if match else content.strip()
 
             st.chat_message("assistant").markdown(f"💡 SQL Query:\n```sql\n{sql_code}\n```")
 
@@ -158,12 +184,10 @@ Question:
             if isinstance(msg, pd.DataFrame):
                 table = go.Figure(data=[go.Table(
                     header=dict(values=list(msg.columns), fill_color='lightgray', align='left'),
-                    cells=dict(values=[msg[col] for col in msg.columns], align='left')
+                    cells=dict(values=[msg[col] for msg in msg.columns], align='left')
                 )])
                 st.chat_message("assistant").plotly_chart(table, use_container_width=True, key=f"history_plot_{hash(str(msg))}")
             else:
                 st.chat_message("assistant").write(str(msg))
 else:
     st.chat_input("Please upload a file to begin.")
-
-
