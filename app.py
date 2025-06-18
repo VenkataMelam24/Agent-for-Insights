@@ -1,164 +1,180 @@
+import os
+import io
+import re
+from datetime import datetime
+
 import streamlit as st
 import pandas as pd
 import duckdb
-import io
-import os
+import requests
 from dotenv import load_dotenv
 from openai import OpenAI
-import requests
 import plotly.graph_objects as go
-from datetime import datetime
-import re
 
-# Load API key
+# ──────────────────────────────────────────────
+# Config & Client
+# ──────────────────────────────────────────────
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 st.set_page_config(page_title="Smart Adhoc Agent", layout="wide")
+st.title("🤖 Smart Adhoc Agent")
 
-# Constants
-MAX_HISTORY = 10
-
-# Cache DuckDB connection
-@st.cache_resource
-def get_connection():
-    return duckdb.connect()
-
-# Cache data loading and date parsing
-@st.cache_data(show_spinner=False)
-def load_and_prepare(file, sheet_url):
-    tables = {}
-    if file:
-        if file.name.endswith(".csv"):
-            df = pd.read_csv(file)
-            tables["data"] = df
-        else:
-            xls = pd.ExcelFile(file)
-            for sheet in xls.sheet_names:
-                df = xls.parse(sheet)
-                name = sheet.lower().replace(" ", "_").replace("-", "_")
-                tables[name] = df
-    elif sheet_url and "docs.google.com" in sheet_url:
-        try:
-            csv_url = sheet_url.replace("/edit#gid=", "/export?format=csv&gid=")
-            content = requests.get(csv_url).content
-            df = pd.read_csv(io.StringIO(content.decode('utf-8')))
-            tables["data"] = df
-        except Exception:
-            pass
-    # Convert date-like strings to datetime
-    def is_date(series):
-        parsed = pd.to_datetime(series, errors='coerce')
-        return parsed.notnull().sum() / len(parsed) > 0.5
-    for name, df in tables.items():
-        for col in df.columns:
-            if df[col].dtype == object and is_date(df[col]):
-                tables[name][col] = pd.to_datetime(df[col], errors='coerce')
-    return tables
-
-# Initialize session
+# ──────────────────────────────────────────────
+# Session State
+# ──────────────────────────────────────────────
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-st.title("🤖 Smart Adhoc Agent")
+# ──────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def load_tables(uploader, sheet_url):
+    tables = {}
+    if uploader:
+        fn = uploader.name.lower()
+        if fn.endswith(".csv"):
+            tables["data"] = pd.read_csv(uploader)
+        elif fn.endswith(".xlsx"):
+            xls = pd.ExcelFile(uploader)
+            for sheet in xls.sheet_names:
+                df = xls.parse(sheet)
+                key = re.sub(r"[^\w]+", "_", sheet.strip().lower())
+                tables[key] = df
+    elif sheet_url and "docs.google.com" in sheet_url:
+        csv_url = sheet_url.replace("/edit#gid=", "/export?format=csv&gid=")
+        resp = requests.get(csv_url)
+        resp.raise_for_status()
+        tables["data"] = pd.read_csv(io.StringIO(resp.text))
+    return tables
 
-# Sidebar: upload
-with st.sidebar:
-    st.header("📁 Upload Data")
-    file = st.file_uploader("Upload Excel or CSV", type=["csv", "xlsx"])
-    sheet_url = st.text_input("Paste public Google Sheets URL")
-    profiling = st.checkbox("Enable profiling & merge options")
+def convert_dates(df):
+    for c in df.select_dtypes("object"):
+        parsed = pd.to_datetime(df[c], errors="coerce")
+        if parsed.notna().mean() > 0.5:
+            df[c] = parsed
+    return df
 
-# Load data & get connection
-tables = load_and_prepare(file, sheet_url)
-con = get_connection()
-
-# Profiling & merge UI
-if profiling and tables:
-    if st.button("Show Table Profiling"):
-        for name, df in tables.items():
-            st.subheader(f"Profiling: {name}")
-            st.dataframe(df.describe(include='all').transpose())
-    if len(tables) > 1 and st.button("Auto-merge Tables"):
+def prepare_duckdb(tables):
+    con = duckdb.connect()
+    for name, df in tables.items():
+        tables[name] = convert_dates(df)
+        con.register(name, tables[name])
+    if len(tables) > 1:
         common = set.intersection(*(set(df.columns) for df in tables.values()))
         if common:
-            names = list(tables.keys())
-            expr = f"USING ({', '.join(common)})"
-            sql = f"SELECT * FROM {names[0]} " + " ".join([f"JOIN {t} {expr}" for t in names[1:]])
+            joins = " ".join(
+                f"JOIN {t} USING ({','.join(common)})"
+                for t in list(tables)[1:]
+            )
+            sql = f"SELECT * FROM {list(tables)[0]} {joins}"
             merged = con.execute(sql).df()
-            tables['merged_data'] = merged
-            con.register('merged_data', merged)
-            st.success(f"Merged on: {', '.join(common)}")
+            con.register("merged_data", merged)
+            tables["merged_data"] = merged
+    return con, tables
 
-# Preview
-if tables:
-    first = next(iter(tables.keys()))
-    st.subheader(f"Preview: {first}")
-    st.dataframe(tables[first].head())
-else:
-    st.info("Upload a file or enter a Google Sheet URL to start.")
+def make_prompt(tables, q):
+    schema = "\n".join(f"{n}: {', '.join(df.columns)}" for n, df in tables.items())
+    return f"""You are a DuckDB SQL expert. Only use these tables/columns:
+{schema}
 
-# Chat interface
-if tables:
-    user_input = st.chat_input("Ask a question about your data")
-    if user_input:
-        # Log and trim history
-        with open('user_logs.csv', 'a') as log:
-            log.write(f"{datetime.now()}\t{user_input}\n")
-        st.session_state.chat_history.append(("user", user_input))
-        st.session_state.chat_history = st.session_state.chat_history[-MAX_HISTORY:]
-        st.chat_message("user").write(user_input)
+Use DuckDB date functions. Output ONLY valid SQL.
 
-        # Prepare prompt
-        schema = "\n".join(f"{n}: {', '.join(df.columns)}" for n, df in tables.items())
-        prompt = (
-            "You are an expert SQL assistant using DuckDB.\n"
-            f"Tables and columns:\n{schema}\n"
-            "Important:\n"
-            "- Date columns are DATE/TIMESTAMP; use EXTRACT(YEAR FROM ...) or YEAR().\n"
-            "- Output ONLY the SQL query; no extra text.\n"
-            f"Question:\n{user_input}\n"
+QUESTION:
+{q}
+"""
+
+def extract_sql(resp_text):
+    m = re.search(r"```sql\s*(.+?)```", resp_text, re.DOTALL)
+    return m.group(1).strip() if m else resp_text.strip()
+
+def run_query(con, sql):
+    df = con.execute(sql).df().reset_index(drop=True)
+    for c in df.select_dtypes("datetime64[ns]"):
+        df[c] = df[c].dt.strftime("%Y-%m")
+    return df
+
+def display_table(df):
+    """Return a styled Plotly table figure for embedding in chat or main view."""
+    rows, cols = df.shape
+    width = min(cols * 100 + 200, 1200)
+    height = min(rows * 30 + 50, 800)
+    colors = ["white" if i % 2 == 0 else "lightgrey" for i in range(rows)]
+    fig = go.Figure(
+        go.Table(
+            header=dict(values=list(df.columns), fill_color="darkslategray", font=dict(color="white", size=14)),
+            cells=dict(values=[df[c] for c in df.columns], fill_color=[colors], align="left")
         )
+    )
+    fig.update_layout(width=width, height=height, margin=dict(t=10,b=10,l=10,r=10))
+    return fig
 
-        # Build messages\        messages = [
-            {"role": "system", "content": "You are a SQL expert for DuckDB."}
-        ] + [
-            {"role": role, "content": msg if isinstance(msg, str) else '<table>'}
-            for role, msg in st.session_state.chat_history
-        ] + [
-            {"role": "user", "content": prompt}
-        ]
+# ──────────────────────────────────────────────
+# Sidebar: Data Load
+# ──────────────────────────────────────────────
+with st.sidebar:
+    st.header("📁 Upload Data")
+    uploaded = st.file_uploader("Excel or CSV", ["csv","xlsx"] )
+    gsheet   = st.text_input("Google Sheet URL")
 
-        # Call GPT
-        resp = client.chat.completions.create(model="gpt-4", messages=messages)
-        content = resp.choices[0].message.content
-        match = re.search(r"```sql\s*(.*?)```", content, re.DOTALL | re.IGNORECASE)
-        sql = match.group(1).strip() if match else content.strip()
+# ──────────────────────────────────────────────
+# Load Data & Notify
+# ──────────────────────────────────────────────
+tables = load_tables(uploaded, gsheet)
+if not tables:
+    st.warning("Please upload a file or paste a Google Sheet URL.")
+    st.stop()
+else:
+    st.success(f"✅ Data loaded successfully! Tables: {', '.join(tables.keys())}")
 
-        # Display SQL
-        st.chat_message("assistant").markdown("```sql\n" + sql + "\n```")
+# ──────────────────────────────────────────────
+# Prepare DB
+# ──────────────────────────────────────────────
+con, tables = prepare_duckdb(tables)
 
-        # Execute and show
-        try:
-            df_res = con.execute(sql).df()
-            if df_res.empty:
-                st.warning("No results found.")
-            else:
-                df_clean = df_res.reset_index(drop=True)
-                for c in df_clean.select_dtypes(include=['datetime64[ns]']):
-                    df_clean[c] = df_clean[c].dt.strftime('%Y-%m')
-                fig = go.Figure(data=[go.Table(
-                    header=dict(values=list(df_clean.columns)),
-                    cells=dict(values=[df_clean[col] for col in df_clean.columns])
-                )])
-                st.chat_message("assistant").plotly_chart(fig, use_container_width=True)
-                st.session_state.chat_history.append(("assistant", df_clean))
-        except Exception as e:
-            st.chat_message("assistant").write(f"SQL Error: {e}")
+# ──────────────────────────────────────────────
+# Chat Input & Response
+# ──────────────────────────────────────────────
+q = st.chat_input("Ask a question about your data")
+if q:
+    with open("user_logs.csv","a") as log:
+        log.write(f"{datetime.now()},{q}\n")
+    st.chat_message("user").write(q)
+    st.session_state.chat_history.append(("user", q))
 
-    # Render history
+    prompt = make_prompt(tables, q)
+    msgs = [
+        {"role":"system","content":"You output DuckDB SQL only."},
+        {"role":"user","content":prompt}
+    ]
+    resp = openai.chat.completions.create(model="gpt-4", messages=msgs)
+    sql = extract_sql(resp.choices[0].message.content)
+
+    # run & display only table
+    try:
+        df = run_query(con, sql)
+        st.session_state.chat_history.append(("assistant", df))
+        fig = display_table(df)
+        idx = len(st.session_state.chat_history)
+        st.chat_message("assistant").plotly_chart(fig, use_container_width=False, key=f"table_{idx}")
+    except Exception as e:
+        st.chat_message("assistant").write(f"⚠️ SQL Error: {e}")
+
+# ──────────────────────────────────────────────
+# Chat History (optional)
+# ──────────────────────────────────────────────
+with st.expander("🕘 Chat History", expanded=False):
     for role, msg in st.session_state.chat_history:
-        if role == "assistant" and isinstance(msg, pd.DataFrame):
-            st.dataframe(msg)
+        if role == "user":
+            st.markdown(f"**You:** {msg}")
         else:
-            st.write(msg)
+            if isinstance(msg, pd.DataFrame):
+                fig = display_table(msg)
+                loop_idx = hash(str(msg))
+                st.plotly_chart(fig, use_container_width=False, key=f"hist_table_{loop_idx}")
+            else:
+                st.markdown(f"**Agent:** {msg}")
+
+
+
