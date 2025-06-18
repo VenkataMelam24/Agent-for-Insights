@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import requests
 import plotly.graph_objects as go
-from datetime import datetime  # ⬅️ NEW: for timestamp logging
+from datetime import datetime  # for timestamp logging
 
 # Load OpenAI API key from .env
 load_dotenv()
@@ -19,7 +19,7 @@ st.set_page_config(page_title="Smart Adhoc Agent", layout="wide")
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# NEW 🔐 Ask user name/email before proceeding
+# Ask user name/email before proceeding
 if "user_id" not in st.session_state:
     st.session_state.user_id = ""
 
@@ -61,6 +61,15 @@ elif sheet_url and "docs.google.com" in sheet_url:
     except Exception as e:
         st.error(f"❌ Failed to read Google Sheet: {e}")
 
+# Fix: convert string columns to datetime if possible (DuckDB EXTRACT fix)
+for name, df in tables.items():
+    for col in df.columns:
+        if df[col].dtype == object:
+            try:
+                df[col] = pd.to_datetime(df[col])
+            except Exception:
+                pass
+
 # Register with DuckDB and show preview
 if tables:
     con = duckdb.connect()
@@ -99,7 +108,7 @@ if tables:
 if tables:
     user_input = st.chat_input("Ask a question about your data")
     if user_input:
-        # NEW ✍️ Log user ID + query + time
+        # Log user ID + query + time
         with open("user_logs.csv", "a") as f:
             f.write(f"{st.session_state.user_id},{user_input},{datetime.now()}\n")
 
