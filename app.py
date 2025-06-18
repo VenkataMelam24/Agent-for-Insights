@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import requests
 import plotly.graph_objects as go
+from datetime import datetime  # ⬅️ NEW: for timestamp logging
 
 # Load OpenAI API key from .env
 load_dotenv()
@@ -17,6 +18,16 @@ st.set_page_config(page_title="Smart Adhoc Agent", layout="wide")
 # Session state
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+
+# NEW 🔐 Ask user name/email before proceeding
+if "user_id" not in st.session_state:
+    st.session_state.user_id = ""
+
+if not st.session_state.user_id:
+    st.session_state.user_id = st.text_input("🔐 Please enter your name or email to begin:")
+
+if not st.session_state.user_id:
+    st.stop()
 
 st.title("🤖 Smart Adhoc Agent")
 
@@ -88,6 +99,10 @@ if tables:
 if tables:
     user_input = st.chat_input("Ask a question about your data")
     if user_input:
+        # NEW ✍️ Log user ID + query + time
+        with open("user_logs.csv", "a") as f:
+            f.write(f"{st.session_state.user_id},{user_input},{datetime.now()}\n")
+
         st.session_state.chat_history.append(("user", user_input))
         st.chat_message("user").write(user_input)
 
