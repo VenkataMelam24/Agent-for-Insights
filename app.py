@@ -7,7 +7,8 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import requests
 import plotly.graph_objects as go
-from datetime import datetime  # for timestamp logging
+from datetime import datetime
+import re  # for robust GPT response parsing
 
 # Load OpenAI API key from .env
 load_dotenv()
@@ -37,7 +38,7 @@ with st.sidebar:
     file = st.file_uploader("Upload Excel or CSV", type=["csv", "xlsx"])
     sheet_url = st.text_input("Paste public Google Sheets URL")
 
-# Load and register data
+# Load data
 tables = {}
 df_preview = None
 if file:
@@ -61,7 +62,7 @@ elif sheet_url and "docs.google.com" in sheet_url:
     except Exception as e:
         st.error(f"❌ Failed to read Google Sheet: {e}")
 
-# Fix: convert string columns to datetime if possible (DuckDB EXTRACT fix)
+# Convert string columns to datetime if possible (DuckDB date fix)
 for name, df in tables.items():
     for col in df.columns:
         if df[col].dtype == object:
@@ -79,7 +80,7 @@ if tables:
         except Exception as e:
             st.warning(f"❌ Failed to register {name}: {e}")
 
-    # Attempt automatic merge if common columns exist
+    # Auto-merge on common columns
     common_cols = set.intersection(*(set(df.columns) for df in tables.values())) if len(tables) > 1 else set()
     if common_cols:
         try:
@@ -93,7 +94,7 @@ if tables:
         except Exception as e:
             st.warning(f"⚠️ Failed to auto-merge tables: {e}")
 
-    # Show preview and profiling for first table
+    # Show preview + profiling
     first_key = next(iter(tables))
     df_preview = tables[first_key]
     st.subheader("📊 Preview of first table")
@@ -104,11 +105,11 @@ if tables:
         profile = df.describe(include='all').transpose()
         st.dataframe(profile)
 
-# User chat
+# User chat input and handling
 if tables:
     user_input = st.chat_input("Ask a question about your data")
     if user_input:
-        # Log user ID + query + time
+        # Log user and query with timestamp
         with open("user_logs.csv", "a") as f:
             f.write(f"{st.session_state.user_id},{user_input},{datetime.now()}\n")
 
@@ -116,24 +117,29 @@ if tables:
         st.chat_message("user").write(user_input)
 
         try:
+            # Prepare schema info for prompt
             schema_description = "\n".join([
                 f"{name} → {', '.join(df.columns)}" for name, df in tables.items()
             ])
 
-            prompt = f"""You are an expert SQL assistant using DuckDB.
-Only use the following tables and columns:
+            # Polished strict prompt forcing only SQL code
+            prompt = f"""
+You are an expert SQL assistant using DuckDB.  
+Only use the following tables and columns exactly as listed:  
 {schema_description}
 
-Rules:
-- Do not guess column names.
-- Use only listed tables/columns.
-- If user asks about time trends, prefer grouping by month if date fields are present.
-- Output only SQL code without explanation.
+Rules:  
+- Do NOT guess any table or column names.  
+- If the user asks about time trends, prefer grouping by month if date/datetime columns are present.  
+- Output ONLY a valid DuckDB SQL query to answer the user's question.  
+- Do NOT include any explanation, comments, or extra text.  
+- The query must be executable on DuckDB with the given tables and columns.
 
-Question:
+User Question:  
 {user_input}
 """
 
+            # Build message history for context, replacing table results with placeholder
             history = [
                 {"role": r, "content": m if isinstance(m, str) else "<table result>"}
                 for r, m in st.session_state.chat_history[-4:]
@@ -145,36 +151,46 @@ Question:
                 {"role": "user", "content": prompt}
             ]
 
+            # Request completion from OpenAI GPT-4
             response = client.chat.completions.create(
                 model="gpt-4",
                 messages=messages
             )
 
-            sql_code = response.choices[0].message.content.strip("```sql").strip("```")
+            # Robustly extract only SQL code between ```sql ... ```
+            content = response.choices[0].message.content
+            match = re.search(r"```sql\s*(.*?)```", content, re.DOTALL | re.IGNORECASE)
+            sql_code = match.group(1).strip() if match else content.strip()
 
+            # Display SQL query to user
             st.chat_message("assistant").markdown(f"💡 SQL Query:\n```sql\n{sql_code}\n```")
 
+            # Run SQL query on DuckDB
             result_df = con.sql(sql_code).df()
 
+            # Clean up index for display
             clean_df = result_df.copy()
             if clean_df.index.name or clean_df.index.to_list() == list(range(len(clean_df))):
                 clean_df.reset_index(drop=True, inplace=True)
 
+            # Format datetime columns for nicer display
             for col in clean_df.select_dtypes(include=["datetime64[ns]"]).columns:
                 clean_df[col] = clean_df[col].dt.strftime('%Y-%m')
 
+            # Show results as a pretty Plotly table
             table = go.Figure(data=[go.Table(
                 header=dict(values=list(clean_df.columns), fill_color='lightgray', align='left'),
                 cells=dict(values=[clean_df[col] for col in clean_df.columns], align='left')
             )])
             st.chat_message("assistant").plotly_chart(table, use_container_width=True, key=f"plot_{len(st.session_state.chat_history)}")
 
+            # Append dataframe result to chat history
             st.session_state.chat_history.append(("assistant", clean_df))
 
         except Exception as e:
             st.chat_message("assistant").write(f"⚠️ GPT or SQL Error: {e}")
 
-    # Show chat history
+    # Show full chat history below
     for role, msg in st.session_state.chat_history:
         if role == "user":
             st.chat_message("user").write(msg)
