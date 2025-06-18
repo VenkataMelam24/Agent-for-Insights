@@ -54,7 +54,6 @@ elif sheet_url and "docs.google.com" in sheet_url:
 
 # Convert possible date-like string columns to datetime for DuckDB compatibility
 def is_date_column(series):
-    # Heuristic: check if >50% values parse as datetime
     parsed = pd.to_datetime(series, errors='coerce')
     non_null_ratio = parsed.notnull().sum() / len(parsed)
     return non_null_ratio > 0.5
@@ -184,7 +183,7 @@ User Question:
             if isinstance(msg, pd.DataFrame):
                 table = go.Figure(data=[go.Table(
                     header=dict(values=list(msg.columns), fill_color='lightgray', align='left'),
-                    cells=dict(values=[msg[col] for msg in msg.columns], align='left')
+                    cells=dict(values=[msg[col] for col in msg.columns], align='left')  # Fixed loop variable here
                 )])
                 st.chat_message("assistant").plotly_chart(table, use_container_width=True, key=f"history_plot_{hash(str(msg))}")
             else:
