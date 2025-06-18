@@ -19,15 +19,14 @@ st.set_page_config(page_title="Smart Adhoc Agent", layout="wide")
 # Constants
 MAX_HISTORY = 10  # max chat entries to keep
 
-# Cache DuckDB connection to avoid reconnects
+# Cache DuckDB connection
 def get_connection():
     return duckdb.connect()
 
 # Cache file loading and preprocessing
-@st.cache_data(show_spinner=False)
+a@st.cache_data(show_spinner=False)
 def load_and_prepare(file, sheet_url):
     tables = {}
-    # Load CSV or Excel
     if file:
         if file.name.endswith(".csv"):
             df = pd.read_csv(file)
@@ -38,7 +37,6 @@ def load_and_prepare(file, sheet_url):
                 df = xls.parse(sheet)
                 name = sheet.lower().replace(" ", "_").replace("-", "_")
                 tables[name] = df
-    # Load Google Sheet
     elif sheet_url and "docs.google.com" in sheet_url:
         try:
             csv_url = sheet_url.replace("/edit#gid=", "/export?format=csv&gid=")
@@ -59,7 +57,7 @@ def load_and_prepare(file, sheet_url):
 
 # Initialize session state
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+    st.session_state.chart_history = []
 
 st.title("🤖 Smart Adhoc Agent")
 
@@ -103,7 +101,7 @@ if tables:
     if user_input:
         # Log query
         with open('user_logs.csv','a') as f:
-            f.write(f"{datetime.now()}	{user_input}\n")
+            f.write(f"{datetime.now()}\t{user_input}\n")
         # Append history and trim
         st.session_state.chat_history.append(("user", user_input))
         st.session_state.chat_history = st.session_state.chat_history[-MAX_HISTORY:]
@@ -123,16 +121,16 @@ Question:
         # Chat completion
         messages = [{"role":"system","content":"You are a SQL expert."}]
         for r, m in st.session_state.chat_history:
-            messages.append({"role":r,"content":m if isinstance(m,str) else '<table>'})
+            messages.append({"role":r,"content": m if isinstance(m,str) else '<table>'})
         messages.append({"role":"user","content":prompt})
         resp = client.chat.completions.create(model="gpt-4", messages=messages)
         text = resp.choices[0].message.content
         m = re.search(r"```sql\s*(.*?)```", text, re.DOTALL|re.IGNORECASE)
         sql = m.group(1).strip() if m else text.strip()
+        # Display and execute
         st.chat_message("assistant").markdown(f"```sql
 {sql}
 ```")
-        # Execute
         try:
             df = con.execute(sql).df()
             if df.empty:
